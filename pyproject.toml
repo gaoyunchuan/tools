@@ -1,0 +1,16 @@
+[project]
+name = "tools"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyyaml>=6.0.2",
+    "rich>=14.1.0",
+    "typer>=0.16.0",
+]
+
+[project.scripts]
+# --- 命令入口点 ---
+# "command-name" = "path.to.module:function_name"
+chart_converter = "tools.helm_chart_converter.chart_converter:app"
