@@ -8,6 +8,7 @@ import os
 import glob
 from typing import Set, List, Dict, Any
 from typing_extensions import Annotated
+from dataclasses import dataclass
 
 try:
     import yaml
@@ -29,35 +30,57 @@ app = typer.Typer(
     rich_markup_mode="markdown"
 )
 
-# --- Core Logic Functions (Unchanged) ---
+# --- Data Structures ---
+@dataclass
+class CommandResult:
+    """封装子进程命令的执行结果。"""
+    stdout: str
+    stderr: str
+    returncode: int
+
+    @property
+    def success(self) -> bool:
+        """如果命令成功执行（返回码为0），则返回 True。"""
+        return self.returncode == 0
+
+# --- Core Logic Functions ---
 
 # 用于从 Helm 模板输出中匹配镜像名称的正则表达式
 IMAGE_REGEX = re.compile(r'image:\s*["\']?([a-zA-Z0-9-./_:@]+)["\']?')
 
 
-def run_command(command: List[str], capture_output=True) -> str:
+def run_command(command: List[str]) -> CommandResult:
     """
-    执行一个 shell 命令并返回其输出。如果命令执行失败，则打印错误并退出程序。
+    执行一个 shell 命令并返回其 stdout, stderr, 和 returncode。
+    这个函数本身不会因为命令失败而退出程序。
+
+    :param command: 要执行的命令列表。
+    :return: 一个包含执行结果的 CommandResult 对象。
     """
     print(f"🔩 正在执行: {' '.join(command)}")
     try:
-        result = subprocess.run(
+        process = subprocess.run(
             command,
             check=True,
-            capture_output=capture_output,
+            capture_output=True,
             text=True,
             encoding='utf-8'
         )
-        if capture_output:
-            return result.stdout
-        return ""
+        return CommandResult(
+            stdout=process.stdout.strip(),
+            stderr=process.stderr.strip(),
+            returncode=process.returncode
+        )
     except FileNotFoundError:
-        print(f"❌ 错误: 命令 '{command[0]}' 未找到。请确认它是否已安装并在系统的 PATH 路径中。")
-        sys.exit(1)
+        print(f"❌ 致命错误: 命令 '{command[0]}' 未找到。请确认它是否已安装并在系统的 PATH 路径中。")
+        raise typer.Exit(code=1)
     except subprocess.CalledProcessError as e:
-        print(f"❌ 命令执行失败: {' '.join(command)}")
-        print(f"   错误输出: {e.stderr}")
-        sys.exit(1)
+        # 命令执行了，但返回了非零退出码
+        return CommandResult(
+            stdout=e.stdout.strip(),
+            stderr=e.stderr.strip(),
+            returncode=e.returncode
+        )
 
 
 def get_images_from_chart(chart_name: str, chart_version: str = None) -> Set[str]:
@@ -68,7 +91,14 @@ def get_images_from_chart(chart_name: str, chart_version: str = None) -> Set[str
     command = ["helm", "template", "release-name-placeholder", chart_name]
     if chart_version:
         command.extend(["--version", chart_version])
-    template_output = run_command(command)
+    
+    result = run_command(command)
+    if not result.success:
+        print(f"❌ 错误: 'helm template' 执行失败。无法从 Chart 中提取镜像。")
+        print(f"   错误详情: {result.stderr}")
+        raise typer.Exit(code=1)
+
+    template_output = result.stdout
     found_images = set(IMAGE_REGEX.findall(template_output))
     
     if not found_images:
@@ -83,16 +113,36 @@ def process_image(original_image: str, private_registry: str):
     拉取、重新标记并推送单个镜像到私有仓库。
     """
     print(f"\n🔄 正在处理镜像: {original_image}")
-    # 构造新的镜像标签，只取原始镜像名的最后一部分
     image_name_part = original_image.split('/')[-1]
     new_image_tag = f"{private_registry}/{image_name_part}"
 
+    # 1. 拉取镜像
     print(f"   -> 拉取 '{original_image}'...")
-    run_command(["docker", "pull", original_image], capture_output=False)
+    pull_result = run_command(["docker", "pull", original_image])
+    if not pull_result.success:
+        print(f"❌ 错误: 拉取镜像 '{original_image}' 失败。")
+        print(f"   错误详情: {pull_result.stderr}")
+        raise typer.Exit(code=1)
+
+    # 2. 标记镜像
     print(f"   -> 标记为 '{new_image_tag}'...")
-    run_command(["docker", "tag", original_image, new_image_tag], capture_output=False)
+    tag_result = run_command(["docker", "tag", original_image, new_image_tag])
+    if not tag_result.success:
+        print(f"❌ 错误: 标记镜像 '{original_image}' 失败。")
+        print(f"   错误详情: {tag_result.stderr}")
+        raise typer.Exit(code=1)
+
+    # 3. 推送镜像
     print(f"   -> 推送至 '{new_image_tag}'...")
-    run_command(["docker", "push", new_image_tag], capture_output=False)
+    push_result = run_command(["docker", "push", new_image_tag])
+    if not push_result.success:
+        if "configured as immutable" in (push_result.stdout + push_result.stderr):
+            print(f"✅ 推送镜像 '{new_image_tag}' 失败，镜像已存在。")
+        else:
+            print(f"❌ 错误: 推送镜像 '{new_image_tag}' 失败。")
+            print(f"   错误详情: {push_result.stderr}")
+            raise typer.Exit(code=1)
+        
     print(f"   ✅ 成功处理 '{original_image}'")
 
 
@@ -106,7 +156,13 @@ def generate_offline_values(chart_name: str, private_registry: str, output_dir: 
     if chart_version:
         command.extend(["--version", chart_version])
     
-    original_values_str = run_command(command)
+    result = run_command(command)
+    if not result.success:
+        print(f"❌ 错误: 'helm show values' 执行失败。无法生成 values 文件。")
+        print(f"   错误详情: {result.stderr}")
+        raise typer.Exit(code=1)
+
+    original_values_str = result.stdout
     original_values = yaml.safe_load(original_values_str)
     
     offline_values = {}
@@ -162,7 +218,14 @@ def run(
     private_registry = registry.rstrip('/')
     chart_simple_name = chart.split('/')[-1]
 
-    run_command(["helm", "repo", "update"], capture_output=False)
+    # 更新 Helm 仓库，即使失败也继续（可能使用本地缓存）
+    print("🔄 正在更新 Helm 仓库...")
+    repo_update_result = run_command(["helm", "repo", "update"])
+    if not repo_update_result.success:
+        print("⚠️  警告: 'helm repo update' 失败。将尝试使用本地缓存。")
+        print(f"   错误详情: {repo_update_result.stderr}")
+    else:
+        print("✅ Helm 仓库更新完成。")
     
     images_to_process = get_images_from_chart(chart, version)
     if not images_to_process:
@@ -184,7 +247,12 @@ def run(
     fetch_command = ["helm", "fetch", chart, "--destination", output_dir]
     if version:
         fetch_command.extend(["--version", version])
-    run_command(fetch_command, capture_output=False)
+    
+    fetch_result = run_command(fetch_command)
+    if not fetch_result.success:
+        print(f"❌ 错误: 'helm fetch' 执行失败。")
+        print(f"   错误详情: {fetch_result.stderr}")
+        raise typer.Exit(code=1)
     
     chart_tgz_list = glob.glob(os.path.join(output_dir, f"{chart_simple_name}-*.tgz"))
     if not chart_tgz_list:
